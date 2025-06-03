@@ -3,6 +3,7 @@ import base64
 import requests
 import tempfile
 import subprocess
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
 # Load credentials
@@ -25,15 +26,10 @@ MODEL_CONFIGS = {
         "context": 8000,
         "payload_type": "messages"
     },
-    "qwancoder": {
-        "url": f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/run/@cf/qwen/qwen2.5-coder-32b-instruct",
-        "context": 32768,  # Fixed comma issue
-        "payload_type": "messages"
-    },
-    "bart_summarizer": {
-        "url": f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/run/@cf/facebook/bart-large-cnn",
+    "flux_image": {
+        "url": f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell",
         "context": 1024,
-        "payload_type": "input_text"
+        "payload_type": "image_generation"
     },
     "whisper_stt": {
         "url": f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/run/@cf/openai/whisper-large-v3-turbo",
@@ -47,122 +43,114 @@ MODEL_CONFIGS = {
     }
 }
 
-# Task-to-model mapping
-def select_model_by_task(task: str) -> str:
-    return {
-        "chat": "llama3",
-        "code": "qwancoder",
-        "summary": "bart_summarizer",
-        "speech_to_text": "whisper_stt",
-        "image_to_text": "image_captioning"
-    }.get(task.lower(), "llama3")
-
-# General Cloudflare AI interface
-def ask_cloudflare_ai(prompt, history=None, model="llama3", parameters=None):
+def ask_cloudflare_ai(prompt: str, history: Optional[list] = None, model: str = "llama3") -> Dict[str, Any]:
+    """General Cloudflare AI interface"""
     history = history or []
-    parameters = parameters or {}
-
-    model_info = MODEL_CONFIGS.get(model, MODEL_CONFIGS["llama3"])
-    payload_type = model_info["payload_type"]
-    context_limit = model_info["context"]
-    url = model_info["url"]
-
+    
     try:
+        model_info = MODEL_CONFIGS.get(model, MODEL_CONFIGS["llama3"])
+        payload_type = model_info["payload_type"]
+        context_limit = model_info["context"]
+        url = model_info["url"]
+        
         if payload_type == "messages":
             messages = history + [{"role": "user", "content": prompt}]
             max_tokens = min(1024, context_limit - len(str(messages)) // 4 - 100)
-            payload = {"messages": messages, "max_tokens": max_tokens, **parameters}
-
-        elif payload_type == "input_text":
-            max_length = min(1024, context_limit - len(prompt) // 4 - 100)
-            payload = {"input_text": prompt, "parameters": {"max_length": max_length, **parameters}}
-
-        elif payload_type == "audio":
-            return {"type": "text", "data": "Use transcribe_audio() for audio input."}
-
-        elif payload_type == "image":
-            return {"type": "text", "data": "Use image_to_text() for image input."}
-
+            payload = {"messages": messages, "max_tokens": max_tokens}
+            
+        elif payload_type == "image_generation":
+            payload = {
+                "prompt": prompt,
+                "seed": int.from_bytes(os.urandom(2), 'big'),
+                "num_inference_steps": 50,
+                "guidance_scale": 7.5
+            }
+            
         else:
             return {"type": "text", "data": f"Unsupported payload type: {payload_type}"}
-
-        res = requests.post(url, headers=HEADERS, json=payload)
-        res.raise_for_status()
-        data = res.json()
-        return {"type": "text", "data": data.get("result", {}).get("response", "No response.")}
-
-    except Exception as e:
-        return {"type": "text", "data": f"Error: {e}"}
-
-# Image generation via external API that returns base64
-def generate_image(prompt: str) -> dict:
-    try:
-        api_url = "https://text-to-image.api-url-production.workers.dev/"
-        payload = {"prompt": prompt}
-        response = requests.post(api_url, json=payload)
+            
+        response = requests.post(url, headers=HEADERS, json=payload)
         response.raise_for_status()
-
         result = response.json()
-        image_data = result.get("image_base64")
-        if not image_data:
-            return {"type": "text", "data": "No image returned from API."}
-
-        return {
-            "type": "image",
-            "data": f"data:image/png;base64,{image_data}",
-            "message": f"Here's your image for: '{prompt}'"
-        }
+        
+        if "error" in result:
+            return {"type": "text", "data": f"API Error: {result['error']}"}
+            
+        if payload_type == "image_generation":
+            image_data = result.get("result", {}).get("image")
+            if not image_data:
+                return {"type": "text", "data": "No image generated"}
+            return {
+                "type": "image",
+                "data": f"data:image/jpeg;base64,{image_data}",
+                "message": f"Generated image for: '{prompt}'"
+            }
+            
+        return {"type": "text", "data": result.get("result", {}).get("response", "No response.")}
+        
     except Exception as e:
-        return {"type": "text", "data": f"Image generation error: {e}"}
+        return {"type": "text", "data": f"Error: {str(e)}"}
 
-# Convert MP3 audio to WAV for Whisper STT
 def convert_audio_to_wav(audio_data: bytes) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as in_file, \
-         tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_file:
+    """Convert MP3 audio to WAV format"""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as in_file, \
+             tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_file:
+            
+            in_file.write(audio_data)
+            in_file.flush()
+            
+            subprocess.run([
+                'ffmpeg', '-i', in_file.name,
+                '-acodec', 'pcm_s16le',
+                '-ac', '1',
+                '-ar', '16000',
+                out_file.name
+            ], check=True)
+            
+            with open(out_file.name, "rb") as f:
+                return f.read()
+    except Exception as e:
+        raise RuntimeError(f"Audio conversion error: {str(e)}")
 
-        in_file.write(audio_data)
-        in_file.flush()
-
-        subprocess.run([
-            'ffmpeg', '-i', in_file.name,
-            '-acodec', 'pcm_s16le',
-            '-ac', '1',
-            '-ar', '16000',
-            out_file.name
-        ], check=True)
-
-        with open(out_file.name, "rb") as f:
-            return f.read()
-
-# Speech-to-text using Whisper
 def transcribe_audio(audio_data: bytes) -> str:
+    """Transcribe audio using Whisper"""
     try:
         wav_data = convert_audio_to_wav(audio_data)
         base64_audio = base64.b64encode(wav_data).decode("utf-8")
-
+        
         payload = {
             "audio": base64_audio,
             "encoding": "wav"
         }
-
+        
         url = MODEL_CONFIGS["whisper_stt"]["url"]
-        res = requests.post(url, headers=HEADERS, json=payload)
-        res.raise_for_status()
-
-        return res.json().get("result", {}).get("text", "❌ Unable to transcribe audio.")
+        response = requests.post(url, headers=HEADERS, json=payload)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result.get("result", {}).get("text", "❌ Unable to transcribe audio.")
     except Exception as e:
-        return f"Error processing audio: {e}"
+        return f"Error processing audio: {str(e)}"
 
-# Image captioning (image-to-text) using LLaVA
 def image_to_text(image_data: bytes) -> str:
+    """Generate image description using LLaVA"""
     try:
         base64_image = base64.b64encode(image_data).decode("utf-8")
         payload = {"image": base64_image}
-
+        
         url = MODEL_CONFIGS["image_captioning"]["url"]
-        res = requests.post(url, headers=HEADERS, json=payload)
-        res.raise_for_status()
-
-        return res.json().get("result", {}).get("response", "❌ Unable to caption image.")
+        response = requests.post(url, headers=HEADERS, json=payload)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result.get("result", {}).get("response", "❌ Unable to analyze image.")
     except Exception as e:
-        return f"Error processing image: {e}"
+        return f"Error processing image: {str(e)}"
+
+def generate_image(prompt: str) -> Dict[str, Any]:
+    """Generate image using Flux"""
+    try:
+        return ask_cloudflare_ai(prompt, model="flux_image")
+    except Exception as e:
+        return {"type": "text", "data": f"Image generation error: {str(e)}"}
