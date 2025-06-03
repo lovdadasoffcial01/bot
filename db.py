@@ -7,14 +7,14 @@ Base = declarative_base()
 
 class Conversation(Base):
     __tablename__ = "conversations"
-
+    
     id = Column(Integer, primary_key=True)
     user_id = Column(String)
-    role = Column(String)  # "user" or "assistant"
-    type = Column(String)  # "text" or "image"
+    role = Column(String)
+    type = Column(String)
     message = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-    is_user = Column(Boolean, default=True)  # <-- Add this line
+    is_user = Column(Boolean, default=True)
 
 engine = create_engine("sqlite:///conversations.db")
 Base.metadata.create_all(engine)
